@@ -27,19 +27,135 @@ type replyContext struct {
 	timestamp string // thread_ts for threading replies
 }
 
+// ---------------------------------------------------------------------------
+// Shared socket pool: one WebSocket per (bot_token, app_token) pair.
+//
+// When multiple projects use the same Slack bot token, Slack delivers each
+// event to only ONE of the WebSocket connections.  If every project opens
+// its own connection, events are randomly distributed and channel-based
+// routing breaks.
+//
+// The pool ensures a single connection is shared.  Incoming events are
+// dispatched to every registered handler; each Platform instance filters
+// by channel_ids and ignores events that don't belong to it.
+// ---------------------------------------------------------------------------
+
+type sharedSocket struct {
+	client   *slack.Client
+	socket   *socketmode.Client
+	cancel   context.CancelFunc
+	handlers []eventHandler
+	mu       sync.Mutex
+}
+
+type eventHandler struct {
+	platform *Platform
+	handler  core.MessageHandler
+}
+
+var (
+	socketPool   = make(map[string]*sharedSocket) // key: bot_token
+	socketPoolMu sync.Mutex
+)
+
+func getOrCreateSocket(botToken, appToken string) *sharedSocket {
+	socketPoolMu.Lock()
+	defer socketPoolMu.Unlock()
+
+	if ss, ok := socketPool[botToken]; ok {
+		return ss
+	}
+
+	client := slack.New(botToken, slack.OptionAppLevelToken(appToken))
+	sock := socketmode.New(client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ss := &sharedSocket{
+		client: client,
+		socket: sock,
+		cancel: cancel,
+	}
+
+	// Single event loop dispatches to all registered handlers
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt := <-sock.Events:
+				ss.dispatch(evt)
+			}
+		}
+	}()
+
+	go func() {
+		if err := sock.RunContext(ctx); err != nil {
+			slog.Error("slack: socket mode error", "error", err)
+		}
+	}()
+
+	socketPool[botToken] = ss
+	slog.Info("slack: socket mode connected (shared)")
+	return ss
+}
+
+func (ss *sharedSocket) addHandler(p *Platform, h core.MessageHandler) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.handlers = append(ss.handlers, eventHandler{platform: p, handler: h})
+}
+
+func (ss *sharedSocket) dispatch(evt socketmode.Event) {
+	slog.Debug("slack: raw event received", "type", evt.Type)
+	switch evt.Type {
+	case socketmode.EventTypeEventsAPI:
+		data, ok := evt.Data.(slackevents.EventsAPIEvent)
+		if !ok {
+			return
+		}
+		if evt.Request != nil {
+			ss.socket.Ack(*evt.Request)
+		}
+
+		// Fan out to all registered handlers — each one filters by channel_ids
+		ss.mu.Lock()
+		handlers := make([]eventHandler, len(ss.handlers))
+		copy(handlers, ss.handlers)
+		ss.mu.Unlock()
+
+		for _, eh := range handlers {
+			eh.platform.handleEventsAPI(data)
+		}
+
+	case socketmode.EventTypeConnecting:
+		slog.Debug("slack: connecting...")
+	case socketmode.EventTypeConnected:
+		slog.Info("slack: connected")
+	case socketmode.EventTypeConnectionError:
+		slog.Error("slack: connection error")
+	}
+}
+
+func (ss *sharedSocket) stop() {
+	ss.cancel()
+}
+
+// ---------------------------------------------------------------------------
+// Platform — one per project, filters events by channel_ids
+// ---------------------------------------------------------------------------
+
 type Platform struct {
 	botToken              string
 	appToken              string
 	allowFrom             string
-	channelIDs            map[string]bool // if non-empty, only respond in these channels
+	channelIDs            map[string]bool
 	shareSessionInChannel bool
 	client                *slack.Client
-	socket                *socketmode.Client
 	handler               core.MessageHandler
-	cancel                context.CancelFunc
 	channelNameCache      map[string]string
 	channelCacheMu        sync.RWMutex
-	userNameCache         sync.Map // userID -> display name
+	userNameCache         sync.Map
+	shared                *sharedSocket
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -52,10 +168,6 @@ func New(opts map[string]any) (core.Platform, error) {
 		return nil, fmt.Errorf("slack: bot_token and app_token are required")
 	}
 
-	// Parse channel_ids: comma-separated list of channel IDs to restrict this
-	// platform instance to. When set, the bot only responds in those channels
-	// and silently ignores messages from other channels. This enables multiple
-	// projects to share the same bot token with channel-based routing.
 	channelIDs := make(map[string]bool)
 	if raw, _ := opts["channel_ids"].(string); raw != "" {
 		for _, id := range strings.Split(raw, ",") {
@@ -81,186 +193,156 @@ func (p *Platform) Name() string { return "slack" }
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 
-	p.client = slack.New(p.botToken,
-		slack.OptionAppLevelToken(p.appToken),
-	)
-	p.socket = socketmode.New(p.client)
+	// Get or create a shared socket for this bot token
+	ss := getOrCreateSocket(p.botToken, p.appToken)
+	p.shared = ss
+	p.client = ss.client
 
-	ctx, cancel := context.WithCancel(context.Background())
-	p.cancel = cancel
+	// Register this platform as a handler on the shared socket
+	ss.addHandler(p, handler)
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case evt := <-p.socket.Events:
-				p.handleEvent(evt)
-			}
-		}
-	}()
-
-	go func() {
-		if err := p.socket.RunContext(ctx); err != nil {
-			slog.Error("slack: socket mode error", "error", err)
-		}
-	}()
-
-	slog.Info("slack: socket mode connected")
+	slog.Info("slack: platform registered on shared socket", "channels", len(p.channelIDs))
 	return nil
 }
 
-func (p *Platform) handleEvent(evt socketmode.Event) {
-	slog.Debug("slack: raw event received", "type", evt.Type)
-	switch evt.Type {
-	case socketmode.EventTypeEventsAPI:
-		data, ok := evt.Data.(slackevents.EventsAPIEvent)
-		if !ok {
-			slog.Debug("slack: EventsAPI type assertion failed")
-			return
-		}
-		slog.Debug("slack: EventsAPI event", "outer_type", data.Type, "inner_type", data.InnerEvent.Type)
-		if evt.Request != nil {
-			p.socket.Ack(*evt.Request)
-		}
+// handleEventsAPI processes an EventsAPI event, filtering by channel_ids.
+func (p *Platform) handleEventsAPI(data slackevents.EventsAPIEvent) {
+	if data.Type != slackevents.CallbackEvent {
+		return
+	}
 
-		if data.Type == slackevents.CallbackEvent {
-			switch ev := data.InnerEvent.Data.(type) {
-			case *slackevents.AppMentionEvent:
-				if ev.BotID != "" || ev.User == "" {
+	switch ev := data.InnerEvent.Data.(type) {
+	case *slackevents.AppMentionEvent:
+		p.handleAppMention(ev)
+	case *slackevents.MessageEvent:
+		p.handleMessage(ev)
+	}
+}
+
+func (p *Platform) handleAppMention(ev *slackevents.AppMentionEvent) {
+	if ev.BotID != "" || ev.User == "" {
+		return
+	}
+
+	if ts := ev.TimeStamp; ts != "" {
+		if dotIdx := strings.IndexByte(ts, '.'); dotIdx > 0 {
+			if sec, err := strconv.ParseInt(ts[:dotIdx], 10, 64); err == nil {
+				if core.IsOldMessage(time.Unix(sec, 0)) {
 					return
 				}
-
-				if ts := ev.TimeStamp; ts != "" {
-					if dotIdx := strings.IndexByte(ts, '.'); dotIdx > 0 {
-						if sec, err := strconv.ParseInt(ts[:dotIdx], 10, 64); err == nil {
-							if core.IsOldMessage(time.Unix(sec, 0)) {
-								slog.Debug("slack: ignoring old app_mention after restart", "ts", ts)
-								return
-							}
-						}
-					}
-				}
-
-				slog.Debug("slack: app_mention received", "user", ev.User, "channel", ev.Channel)
-
-				if len(p.channelIDs) > 0 && !p.channelIDs[ev.Channel] {
-					slog.Debug("slack: app_mention in non-matching channel, ignoring", "channel", ev.Channel)
-					return
-				}
-
-				if !core.AllowList(p.allowFrom, ev.User) {
-					slog.Debug("slack: app_mention from unauthorized user", "user", ev.User)
-					return
-				}
-
-				var sessionKey string
-				if p.shareSessionInChannel {
-					sessionKey = fmt.Sprintf("slack:%s", ev.Channel)
-				} else {
-					sessionKey = fmt.Sprintf("slack:%s:%s", ev.Channel, ev.User)
-				}
-
-				msg := &core.Message{
-					SessionKey: sessionKey, Platform: "slack",
-					UserID: ev.User, UserName: p.resolveUserName(ev.User),
-					ChatName: p.resolveChannelNameForMsg(ev.Channel),
-					Content:   stripAppMentionText(ev.Text),
-					MessageID: ev.TimeStamp,
-					ReplyCtx:  replyContext{channel: ev.Channel, timestamp: ev.TimeStamp},
-				}
-				if msg.Content == "" {
-					return
-				}
-				p.handler(p, msg)
-
-			case *slackevents.MessageEvent:
-				if ev.BotID != "" || ev.User == "" {
-					return
-				}
-
-				if ts := ev.TimeStamp; ts != "" {
-					if dotIdx := strings.IndexByte(ts, '.'); dotIdx > 0 {
-						if sec, err := strconv.ParseInt(ts[:dotIdx], 10, 64); err == nil {
-							if core.IsOldMessage(time.Unix(sec, 0)) {
-								slog.Debug("slack: ignoring old message after restart", "ts", ts)
-								return
-							}
-						}
-					}
-				}
-
-				slog.Debug("slack: message received", "user", ev.User, "channel", ev.Channel)
-
-				if len(p.channelIDs) > 0 && !p.channelIDs[ev.Channel] {
-					slog.Debug("slack: message in non-matching channel, ignoring", "channel", ev.Channel)
-					return
-				}
-
-				if !core.AllowList(p.allowFrom, ev.User) {
-					slog.Debug("slack: message from unauthorized user", "user", ev.User)
-					return
-				}
-
-				var sessionKey string
-				if p.shareSessionInChannel {
-					sessionKey = fmt.Sprintf("slack:%s", ev.Channel)
-				} else {
-					sessionKey = fmt.Sprintf("slack:%s:%s", ev.Channel, ev.User)
-				}
-				ts := ev.TimeStamp
-
-				var images []core.ImageAttachment
-				var audio *core.AudioAttachment
-				for _, f := range ev.Files {
-					if f.Mimetype != "" && strings.HasPrefix(f.Mimetype, "audio/") {
-						data, err := p.downloadSlackFile(f.URLPrivateDownload)
-						if err != nil {
-							slog.Error("slack: download audio failed", "error", err)
-							continue
-						}
-						format := "mp3"
-						if parts := strings.SplitN(f.Mimetype, "/", 2); len(parts) == 2 {
-							format = parts[1]
-						}
-						audio = &core.AudioAttachment{
-							MimeType: f.Mimetype, Data: data, Format: format,
-						}
-					} else if f.Mimetype != "" && strings.HasPrefix(f.Mimetype, "image/") {
-						imgData, err := p.downloadSlackFile(f.URLPrivateDownload)
-						if err != nil {
-							slog.Error("slack: download file failed", "error", err)
-							continue
-						}
-						images = append(images, core.ImageAttachment{
-							MimeType: f.Mimetype, Data: imgData, FileName: f.Name,
-						})
-					}
-				}
-
-				if ev.Text == "" && len(images) == 0 && audio == nil {
-					return
-				}
-
-				msg := &core.Message{
-					SessionKey: sessionKey, Platform: "slack",
-					UserID: ev.User, UserName: p.resolveUserName(ev.User),
-					ChatName: p.resolveChannelNameForMsg(ev.Channel),
-					Content: ev.Text, Images: images, Audio: audio,
-					MessageID: ts,
-					ReplyCtx: replyContext{channel: ev.Channel, timestamp: ts},
-				}
-				p.handler(p, msg)
 			}
 		}
-
-	case socketmode.EventTypeConnecting:
-		slog.Debug("slack: connecting...")
-	case socketmode.EventTypeConnected:
-		slog.Info("slack: connected")
-	case socketmode.EventTypeConnectionError:
-		slog.Error("slack: connection error")
 	}
+
+	// Channel filter
+	if len(p.channelIDs) > 0 && !p.channelIDs[ev.Channel] {
+		return
+	}
+
+	slog.Debug("slack: app_mention received", "user", ev.User, "channel", ev.Channel)
+
+	if !core.AllowList(p.allowFrom, ev.User) {
+		slog.Debug("slack: app_mention from unauthorized user", "user", ev.User)
+		return
+	}
+
+	var sessionKey string
+	if p.shareSessionInChannel {
+		sessionKey = fmt.Sprintf("slack:%s", ev.Channel)
+	} else {
+		sessionKey = fmt.Sprintf("slack:%s:%s", ev.Channel, ev.User)
+	}
+
+	msg := &core.Message{
+		SessionKey: sessionKey, Platform: "slack",
+		UserID: ev.User, UserName: p.resolveUserName(ev.User),
+		ChatName: p.resolveChannelNameForMsg(ev.Channel),
+		Content:   stripAppMentionText(ev.Text),
+		MessageID: ev.TimeStamp,
+		ReplyCtx:  replyContext{channel: ev.Channel, timestamp: ev.TimeStamp},
+	}
+	if msg.Content == "" {
+		return
+	}
+	p.handler(p, msg)
+}
+
+func (p *Platform) handleMessage(ev *slackevents.MessageEvent) {
+	if ev.BotID != "" || ev.User == "" {
+		return
+	}
+
+	if ts := ev.TimeStamp; ts != "" {
+		if dotIdx := strings.IndexByte(ts, '.'); dotIdx > 0 {
+			if sec, err := strconv.ParseInt(ts[:dotIdx], 10, 64); err == nil {
+				if core.IsOldMessage(time.Unix(sec, 0)) {
+					return
+				}
+			}
+		}
+	}
+
+	// Channel filter
+	if len(p.channelIDs) > 0 && !p.channelIDs[ev.Channel] {
+		return
+	}
+
+	slog.Debug("slack: message received", "user", ev.User, "channel", ev.Channel)
+
+	if !core.AllowList(p.allowFrom, ev.User) {
+		slog.Debug("slack: message from unauthorized user", "user", ev.User)
+		return
+	}
+
+	var sessionKey string
+	if p.shareSessionInChannel {
+		sessionKey = fmt.Sprintf("slack:%s", ev.Channel)
+	} else {
+		sessionKey = fmt.Sprintf("slack:%s:%s", ev.Channel, ev.User)
+	}
+	ts := ev.TimeStamp
+
+	var images []core.ImageAttachment
+	var audio *core.AudioAttachment
+	for _, f := range ev.Files {
+		if f.Mimetype != "" && strings.HasPrefix(f.Mimetype, "audio/") {
+			data, err := p.downloadSlackFile(f.URLPrivateDownload)
+			if err != nil {
+				slog.Error("slack: download audio failed", "error", err)
+				continue
+			}
+			format := "mp3"
+			if parts := strings.SplitN(f.Mimetype, "/", 2); len(parts) == 2 {
+				format = parts[1]
+			}
+			audio = &core.AudioAttachment{
+				MimeType: f.Mimetype, Data: data, Format: format,
+			}
+		} else if f.Mimetype != "" && strings.HasPrefix(f.Mimetype, "image/") {
+			imgData, err := p.downloadSlackFile(f.URLPrivateDownload)
+			if err != nil {
+				slog.Error("slack: download file failed", "error", err)
+				continue
+			}
+			images = append(images, core.ImageAttachment{
+				MimeType: f.Mimetype, Data: imgData, FileName: f.Name,
+			})
+		}
+	}
+
+	if ev.Text == "" && len(images) == 0 && audio == nil {
+		return
+	}
+
+	msg := &core.Message{
+		SessionKey: sessionKey, Platform: "slack",
+		UserID: ev.User, UserName: p.resolveUserName(ev.User),
+		ChatName: p.resolveChannelNameForMsg(ev.Channel),
+		Content: ev.Text, Images: images, Audio: audio,
+		MessageID: ts,
+		ReplyCtx: replyContext{channel: ev.Channel, timestamp: ts},
+	}
+	p.handler(p, msg)
 }
 
 func stripAppMentionText(text string) string {
@@ -378,8 +460,7 @@ func (p *Platform) ResolveChannelName(channelID string) (string, error) {
 }
 
 func (p *Platform) Stop() error {
-	if p.cancel != nil {
-		p.cancel()
-	}
+	// Don't stop the shared socket — other projects may still use it.
+	// The socket is cleaned up when the process exits.
 	return nil
 }
