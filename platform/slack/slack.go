@@ -31,6 +31,7 @@ type Platform struct {
 	botToken              string
 	appToken              string
 	allowFrom             string
+	channelIDs            map[string]bool // if non-empty, only respond in these channels
 	shareSessionInChannel bool
 	client                *slack.Client
 	socket                *socketmode.Client
@@ -50,10 +51,26 @@ func New(opts map[string]any) (core.Platform, error) {
 	if botToken == "" || appToken == "" {
 		return nil, fmt.Errorf("slack: bot_token and app_token are required")
 	}
+
+	// Parse channel_ids: comma-separated list of channel IDs to restrict this
+	// platform instance to. When set, the bot only responds in those channels
+	// and silently ignores messages from other channels. This enables multiple
+	// projects to share the same bot token with channel-based routing.
+	channelIDs := make(map[string]bool)
+	if raw, _ := opts["channel_ids"].(string); raw != "" {
+		for _, id := range strings.Split(raw, ",") {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				channelIDs[id] = true
+			}
+		}
+	}
+
 	return &Platform{
 		botToken:              botToken,
 		appToken:              appToken,
 		allowFrom:             allowFrom,
+		channelIDs:            channelIDs,
 		shareSessionInChannel: shareSessionInChannel,
 		channelNameCache:      make(map[string]string),
 	}, nil
@@ -127,6 +144,11 @@ func (p *Platform) handleEvent(evt socketmode.Event) {
 
 				slog.Debug("slack: app_mention received", "user", ev.User, "channel", ev.Channel)
 
+				if len(p.channelIDs) > 0 && !p.channelIDs[ev.Channel] {
+					slog.Debug("slack: app_mention in non-matching channel, ignoring", "channel", ev.Channel)
+					return
+				}
+
 				if !core.AllowList(p.allowFrom, ev.User) {
 					slog.Debug("slack: app_mention from unauthorized user", "user", ev.User)
 					return
@@ -169,6 +191,11 @@ func (p *Platform) handleEvent(evt socketmode.Event) {
 				}
 
 				slog.Debug("slack: message received", "user", ev.User, "channel", ev.Channel)
+
+				if len(p.channelIDs) > 0 && !p.channelIDs[ev.Channel] {
+					slog.Debug("slack: message in non-matching channel, ignoring", "channel", ev.Channel)
+					return
+				}
 
 				if !core.AllowList(p.allowFrom, ev.User) {
 					slog.Debug("slack: message from unauthorized user", "user", ev.User)
