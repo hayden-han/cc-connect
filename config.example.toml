@@ -1063,30 +1063,35 @@ app_secret = "your-feishu-app-secret"
 # token = "your-telegram-bot-token"
 
 # =============================================================================
-# Project 8: Ollama (local LLM) / 项目 8：Ollama（本地大语言模型）
+# Project 8: Local Model / 项目 8：本地模型
 # =============================================================================
-# Ollama agent connects to a local Ollama instance via HTTP API.
-# Unlike other agents that wrap CLI tools, this agent talks directly to
-# Ollama's /api/chat endpoint with streaming. Suitable for local models
-# like Qwen, Llama, Mistral, etc.
-# Ollama agent 通过 HTTP API 连接到本地 Ollama 实例。
-# 与其他包装 CLI 工具的 agent 不同，它直接调用 Ollama 的 /api/chat 接口。
-# 适用于 Qwen、Llama、Mistral 等本地模型。
+# Local model agent connects to any local LLM server via HTTP API.
+# Supports two API formats (auto-detected):
+#   - "ollama":  Ollama native API (/api/chat with NDJSON streaming)
+#   - "openai":  OpenAI-compatible API (/v1/chat/completions with SSE)
 #
-# Requires: Ollama running locally (https://ollama.com)
-# 需要安装并运行 Ollama（https://ollama.com）
+# Compatible with: Ollama, vLLM, llama.cpp server, LM Studio, LocalAI,
+# text-generation-webui, and any OpenAI-compatible local server.
+#
+# 本地模型 agent 通过 HTTP API 连接到本地 LLM 服务器。
+# 支持两种 API 格式（自动检测）：
+#   - "ollama": Ollama 原生 API
+#   - "openai": OpenAI 兼容 API
+# 兼容 Ollama、vLLM、llama.cpp、LM Studio、LocalAI 等。
 
 # [[projects]]
 # name = "local-llm"
 #
 # [projects.agent]
-# type = "ollama"
+# type = "localmodel"
 #
 # [projects.agent.options]
-# base_url = "http://localhost:11434"  # Ollama API URL (default: http://localhost:11434)
-# model = "qwen3:8b"                  # Model name (default: qwen3:8b) / 模型名称
+# base_url = "http://localhost:11434"  # Server URL (default: http://localhost:11434)
+# model = "qwen3:8b"                  # Model name / 模型名称
 # work_dir = "/path/to/project"       # Working directory / 工作目录
 # timeout_mins = 5                    # Response timeout in minutes (default: 5) / 响应超时（分钟）
+# api_format = ""                     # "ollama", "openai", or "" for auto-detect / 留空自动检测
+# api_key = ""                        # Optional API key for OpenAI-compatible servers / 可选 API 密钥
 #
 # [[projects.platforms]]
 # type = "slack"
